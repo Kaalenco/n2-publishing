@@ -3,16 +3,31 @@
 BeforeAll {
     Import-Module (Join-Path $PSScriptRoot '..' 'scripts' 'Promotion.psm1') -Force
     $script:Now = [datetime]::new(2026, 12, 1, 6, 0, 0, [DateTimeKind]::Utc)
-    function New-VaultVersion([string] $Version, [int] $DaysOld, [bool] $Deleted = $false) {
-        [pscustomobject]@{ Version = $Version; PublishDate = $script:Now.AddDays(-$DaysOld); IsDeleted = $Deleted }
+    function New-VaultVersion([string] $Version, [int] $DaysOld, [bool] $Deleted = $false, [bool] $Listed = $true) {
+        [pscustomobject]@{ Version = $Version; PublishDate = $script:Now.AddDays(-$DaysOld); IsDeleted = $Deleted; IsListed = $Listed }
     }
 }
 
 Describe 'ConvertTo-ReleaseVersion' {
-    It 'parses a release version' { ConvertTo-ReleaseVersion '2.0.1' | Should -Be ([version] '2.0.1') }
-    It 'ignores build metadata' { ConvertTo-ReleaseVersion '2.0.1+abc' | Should -Be ([version] '2.0.1') }
+    It 'parses a release version (padded to 4 parts)' { ConvertTo-ReleaseVersion '2.0.1' | Should -Be ([version] '2.0.1.0') }
+    It 'ignores build metadata' { ConvertTo-ReleaseVersion '2.0.1+abc' | Should -Be ([version] '2.0.1.0') }
     It 'rejects a prerelease' { ConvertTo-ReleaseVersion '2.1.0-beta.1' | Should -BeNullOrEmpty }
+    It 'treats missing Build and Revision as 0' {
+        ConvertTo-ReleaseVersion '2.0.0.0' | Should -Be (ConvertTo-ReleaseVersion '2.0.0')
+        ConvertTo-ReleaseVersion '2.0' | Should -Be (ConvertTo-ReleaseVersion '2.0.0')
+    }
     It 'rejects garbage' { ConvertTo-ReleaseVersion 'abc' | Should -BeNullOrEmpty }
+}
+
+Describe 'Get-MaxReleaseVersion' {
+    It 'returns the original string of the highest release' {
+        Get-MaxReleaseVersion @('1.7.0', '1.10.0', '3.0.0-alpha', '1.9.0') | Should -Be '1.10.0'
+    }
+    It 'does not pad the returned string' { Get-MaxReleaseVersion @('1.7.0') | Should -BeExactly '1.7.0' }
+    It 'returns nothing without release versions' {
+        Get-MaxReleaseVersion @('1.0.0-beta') | Should -BeNullOrEmpty
+        Get-MaxReleaseVersion @() | Should -BeNullOrEmpty
+    }
 }
 
 Describe 'Select-EligibleVersion (scheduled rules)' {
@@ -39,6 +54,22 @@ Describe 'Select-EligibleVersion (scheduled rules)' {
     It 'falls back to an older eligible version when the newest is too young' {
         $vault = @((New-VaultVersion '2.0.0' 20), (New-VaultVersion '2.0.1' 2))
         Select-EligibleVersion -VaultVersions $vault -NuGetOrgVersions @('1.7.0') -Now $Now -MinAgeDays 7 | Should -Be '2.0.0'
+    }
+    It 'picks the highest of several eligible versions regardless of order' {
+        $vault = @((New-VaultVersion '1.8.0' 30), (New-VaultVersion '2.0.0' 20), (New-VaultVersion '1.7.5' 10))
+        Select-EligibleVersion -VaultVersions $vault -NuGetOrgVersions @('1.7.0') -Now $Now -MinAgeDays 7 | Should -Be '2.0.0'
+    }
+    It 'skips everything when nuget.org is already newer' {
+        $vault = @(New-VaultVersion '2.0.0' 20)
+        Select-EligibleVersion -VaultVersions $vault -NuGetOrgVersions @('3.0.0') -Now $Now -MinAgeDays 7 | Should -BeNullOrEmpty
+    }
+    It 'treats 2.0.0.0 on nuget.org as equal to 2.0.0 on the vault' {
+        $vault = @(New-VaultVersion '2.0.0' 20)
+        Select-EligibleVersion -VaultVersions $vault -NuGetOrgVersions @('2.0.0.0') -Now $Now -MinAgeDays 7 | Should -BeNullOrEmpty
+    }
+    It 'ignores unlisted vault versions' {
+        $vault = @((New-VaultVersion '2.0.0' 20 $false $false), (New-VaultVersion '1.8.0' 20))
+        Select-EligibleVersion -VaultVersions $vault -NuGetOrgVersions @('1.7.0') -Now $Now -MinAgeDays 7 | Should -Be '1.8.0'
     }
     It 'ignores deleted vault versions' {
         $vault = @(New-VaultVersion '2.0.0' 20 $true)
@@ -71,8 +102,14 @@ Describe 'Test-ExplicitVersion (manual rules, age skipped)' {
     It 'refuses a version missing on the vault' {
         Test-ExplicitVersion -Version '2.0.2' -VaultVersions @(New-VaultVersion '2.0.1' 0) -NuGetOrgVersions @() | Should -Be 'not on vault-packages'
     }
+    It 'refuses an unlisted vault version' {
+        Test-ExplicitVersion -Version '2.0.0' -VaultVersions @(New-VaultVersion '2.0.0' 0 $false $false) -NuGetOrgVersions @() | Should -Be 'unlisted on vault-packages'
+    }
     It 'refuses a version not newer than nuget.org' {
-        Test-ExplicitVersion -Version '2.0.0' -VaultVersions @(New-VaultVersion '2.0.0' 0) -NuGetOrgVersions @('2.0.0') | Should -Match 'not newer'
+        Test-ExplicitVersion -Version '2.0.0' -VaultVersions @(New-VaultVersion '2.0.0' 0) -NuGetOrgVersions @('2.0.0') | Should -Be 'not newer than nuget.org 2.0.0'
+    }
+    It 'treats 2.0.0 as equal to 2.0.0.0 on nuget.org' {
+        Test-ExplicitVersion -Version '2.0.0' -VaultVersions @(New-VaultVersion '2.0.0' 0) -NuGetOrgVersions @('2.0.0.0') | Should -Be 'not newer than nuget.org 2.0.0.0'
     }
 }
 

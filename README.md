@@ -21,14 +21,24 @@ Workflow `.github/workflows/publish.yml`:
 
 The `plan` job runs the Pester tests for the rules, decides, downloads and records the SHA-256
 of each file. The `push` job (environment `production`) re-checks the hashes and pushes with
-`--skip-duplicate`. A nuget.org version cannot be deleted, only unlisted.
+`--skip-duplicate`, after refusing non-`N2.*` ids and checking that the nuspec inside each
+package matches the plan. A nuget.org version cannot be deleted, only unlisted.
+
+Design decision: [ADR 0001](docs/adr/0001-promote-n2-packages-to-nuget-org-with-trusted-publishing.md).
 
 ## Authentication
 
 - nuget.org: Trusted Publishing. The `push` job exchanges its GitHub OIDC token for a
-  short-lived nuget.org key (`NuGet/login`). No API key is stored. The nuget.org policy
-  `n2-package-publishing` (owner `gjkaal`) names repository `Kaalenco/n2-publishing`, workflow
-  file `publish.yml` and environment `production`.
+  short-lived nuget.org key (`NuGet/login`). No API key is stored. The nuget.org user is set in
+  the workflow (`publish.yml`, step `NuGet/login`), not in `promotion.json`. The nuget.org
+  policy `n2-package-publishing` (owner `gjkaal`) names repository `Kaalenco/n2-publishing`,
+  workflow file `publish.yml` and environment `production`. The policy is scoped to the owner,
+  not to an id pattern: the `N2.*` check in the scripts and in the workflow is the id
+  restriction.
+- The repository is public (nothing secret in it). Environment `production` (set on 2026-11-18)
+  requires a reviewer (the repository owner) and accepts deployments from `trunk` only, so the
+  monthly run waits for approval before the `push` job starts. Branch protection on `trunk`
+  forbids force pushes and deletion.
 - vault-packages: repository secret `NUGET_PAT`, a read-only Azure DevOps PAT with scope
   Packaging (Read). Only the `plan` job sees it.
 
@@ -41,5 +51,5 @@ Invoke-Pester -Path tests
 ## Adding a package
 
 Add its id to `packages` in `promotion.json`, in dependency order. Only `N2.*` ids are
-accepted (the script refuses anything else, matching the nuget.org scope). The nuget.org owner of the
+accepted (the script refuses anything else; the policy itself is not id-scoped). The nuget.org owner of the
 package must be `gjkaal` (the trusted publishing policy covers packages owned by that user).

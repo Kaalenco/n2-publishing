@@ -13,21 +13,25 @@ function ConvertTo-ReleaseVersion {
     $core = $Version.Split('+', 2)[0]
     if ($core -match '-') { return $null }
     $parsed = $null
-    if ([version]::TryParse($core, [ref] $parsed)) { return $parsed }
+    if ([version]::TryParse($core, [ref] $parsed)) {
+        # Missing Build/Revision count as 0, so 2.0.0.0 equals 2.0.0.
+        return [version]::new($parsed.Major, $parsed.Minor, [Math]::Max($parsed.Build, 0), [Math]::Max($parsed.Revision, 0))
+    }
     return $null
 }
 
-# Highest release version in a list of version strings, or $null.
+# Highest release version in a list of version strings, returned as the original string
+# (for messages and summaries), or $null. Compare it via ConvertTo-ReleaseVersion.
 function Get-MaxReleaseVersion {
     param([string[]] $Versions)
-    $releases = @($Versions | ForEach-Object { ConvertTo-ReleaseVersion $_ } | Where-Object { $_ })
+    $releases = @($Versions | Where-Object { $_ -and (ConvertTo-ReleaseVersion $_) })
     if ($releases.Count -eq 0) { return $null }
-    return ($releases | Sort-Object -Descending | Select-Object -First 1)
+    return ($releases | Sort-Object { ConvertTo-ReleaseVersion $_ } -Descending | Select-Object -First 1)
 }
 
-# Scheduled rule. VaultVersions: objects with Version (string), PublishDate (datetime), IsDeleted (bool).
+# Scheduled rule. VaultVersions: objects with Version (string), PublishDate (datetime), IsDeleted (bool), IsListed (bool).
 # Returns the vault version string to promote, or $null:
-#   - release version (no prerelease suffix), not deleted;
+#   - release version (no prerelease suffix), not deleted, listed;
 #   - published on the vault at least MinAgeDays before Now;
 #   - newer than the highest release version on nuget.org.
 function Select-EligibleVersion {
@@ -39,7 +43,7 @@ function Select-EligibleVersion {
     )
     $cutoff = $Now.ToUniversalTime().AddDays(-$MinAgeDays)
     $candidates = @($VaultVersions | Where-Object {
-            -not $_.IsDeleted -and
+            -not $_.IsDeleted -and $_.IsListed -and
             (ConvertTo-ReleaseVersion $_.Version) -and
             ([datetime] $_.PublishDate).ToUniversalTime() -le $cutoff
         })
@@ -47,7 +51,7 @@ function Select-EligibleVersion {
 
     $best = $candidates | Sort-Object { ConvertTo-ReleaseVersion $_.Version } -Descending | Select-Object -First 1
     $nugetMax = Get-MaxReleaseVersion $NuGetOrgVersions
-    if ($nugetMax -and (ConvertTo-ReleaseVersion $best.Version) -le $nugetMax) { return $null }
+    if ($nugetMax -and (ConvertTo-ReleaseVersion $best.Version) -le (ConvertTo-ReleaseVersion $nugetMax)) { return $null }
     return $best.Version
 }
 
@@ -61,16 +65,18 @@ function Test-ExplicitVersion {
     )
     $release = ConvertTo-ReleaseVersion $Version
     if (-not $release) { return 'not a release version' }
-    $onVault = @($VaultVersions | Where-Object {
+    $matching = @($VaultVersions | Where-Object {
             -not $_.IsDeleted -and (ConvertTo-ReleaseVersion $_.Version) -eq $release
         })
-    if ($onVault.Count -eq 0) { return 'not on vault-packages' }
+    if ($matching.Count -eq 0) { return 'not on vault-packages' }
+    if (@($matching | Where-Object { $_.IsListed }).Count -eq 0) { return 'unlisted on vault-packages' }
     $nugetMax = Get-MaxReleaseVersion $NuGetOrgVersions
-    if ($nugetMax -and $release -le $nugetMax) { return "not newer than nuget.org $nugetMax" }
+    if ($nugetMax -and $release -le (ConvertTo-ReleaseVersion $nugetMax)) { return "not newer than nuget.org $nugetMax" }
     return $null
 }
 
-# Only N2.* packages may be promoted (matches the nuget.org API scope / policy: glob N2.*).
+# Only N2.* packages may be promoted. The nuget.org trusted publishing policy is scoped to the
+# owner, not to an id pattern, so this check (and the same check in publish.yml) is the id restriction.
 function Test-AllowedPackageId {
     param([Parameter(Mandatory)][string] $Id)
     return $Id -like 'N2.*'
@@ -112,9 +118,10 @@ function Get-VaultVersions {
     if (-not $package) { return @() }
     return @($package.versions | ForEach-Object {
             [pscustomobject]@{
-                Version     = $_.version
+                Version     = if ($_.PSObject.Properties['normalizedVersion'] -and $_.normalizedVersion) { $_.normalizedVersion } else { $_.version }
                 PublishDate = [datetime] $_.publishDate
                 IsDeleted   = [bool] ($_.PSObject.Properties['isDeleted'] -and $_.isDeleted)
+                IsListed    = -not ($_.PSObject.Properties['isListed'] -and $_.isListed -eq $false)
             }
         })
 }
@@ -126,7 +133,8 @@ function Get-NuGetOrgVersions {
         return @((Invoke-RestMethod -Uri "$NuGetOrgFlatContainer/$($Id.ToLowerInvariant())/index.json").versions)
     }
     catch {
-        if ($_.Exception.Response -and [int] $_.Exception.Response.StatusCode -eq 404) { return @() }
+        $property = $_.Exception.PSObject.Properties['Response']
+        if ($property -and $property.Value -and [int] $property.Value.StatusCode -eq 404) { return @() }
         throw
     }
 }
@@ -163,7 +171,8 @@ function Save-VaultPackage {
         try { [xml] $nuspec = $reader.ReadToEnd() } finally { $reader.Dispose() }
     }
     finally { $zip.Dispose() }
-    if ($nuspec.package.metadata.id -ne $Id -or $nuspec.package.metadata.version -ne $Version) {
+    $nuspecVersion = ConvertTo-ReleaseVersion ([string] $nuspec.package.metadata.version)
+    if ($nuspec.package.metadata.id -ne $Id -or -not $nuspecVersion -or $nuspecVersion -ne (ConvertTo-ReleaseVersion $Version)) {
         throw "Downloaded $($nuspec.package.metadata.id) $($nuspec.package.metadata.version), expected $Id $Version."
     }
     return $file

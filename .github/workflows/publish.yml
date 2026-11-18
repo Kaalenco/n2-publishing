@@ -55,18 +55,20 @@ jobs:
         run: ./scripts/Plan-Promotion.ps1 -OutDir out -ExplicitPackages "$env:EXPLICIT_PACKAGES"
 
       - name: Upload packages
-        if: steps.plan.outputs.count != '0'
+        # Only needed by the push job; the repository is public, so a dry run uploads nothing.
+        if: steps.plan.outputs.count != '0' && (github.event_name == 'schedule' || inputs.dry_run == false)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: packages
           path: out/
-          retention-days: 7
+          retention-days: 1
 
   push:
     needs: plan
     if: needs.plan.outputs.count != '0' && (github.event_name == 'schedule' || inputs.dry_run == false)
     runs-on: ubuntu-latest
-    # Optional gate: add required reviewers to this environment in the repository settings.
+    # Gate: the environment requires a reviewer (the repository owner) and only accepts
+    # deployments from trunk, so the scheduled run waits for approval.
     environment: production
     permissions:
       id-token: write
@@ -91,8 +93,32 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $plan = Get-Content out/plan.json -Raw | ConvertFrom-Json
           foreach ($item in $plan) {
+            if ($item.Id -notlike 'N2.*') { throw "Refusing $($item.Id): outside N2.*." }
             $file = Join-Path out $item.File
             if ((Get-FileHash $file -Algorithm SHA256).Hash -ne $item.Sha256) { throw "Hash mismatch for $($item.File)." }
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $file).Path)
+            try {
+              $entry = $zip.Entries | Where-Object { $_.FullName -notlike '*/*' -and $_.Name -like '*.nuspec' } | Select-Object -First 1
+              if (-not $entry) { throw "No nuspec in $($item.File)." }
+              $reader = [System.IO.StreamReader]::new($entry.Open())
+              try { [xml] $nuspec = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            }
+            finally { $zip.Dispose() }
+            $meta = $nuspec.package.metadata
+            # Same normalization as ConvertTo-ReleaseVersion (inline: this job has no checkout).
+            function ConvertTo-Release([string] $Text) {
+              $core = $Text.Split('+', 2)[0]
+              if ($core -match '-') { return $null }
+              $parsed = $null
+              if (-not [version]::TryParse($core, [ref] $parsed)) { return $null }
+              return [version]::new($parsed.Major, $parsed.Minor, [Math]::Max($parsed.Build, 0), [Math]::Max($parsed.Revision, 0))
+            }
+            $nuspecVersion = ConvertTo-Release ([string] $meta.version)
+            $planVersion = ConvertTo-Release ([string] $item.Version)
+            if (-not $nuspecVersion -or -not $planVersion -or $meta.id -ne $item.Id -or $nuspecVersion -ne $planVersion) {
+              throw "Nuspec of $($item.File) is $($meta.id) $($meta.version), plan says $($item.Id) $($item.Version)."
+            }
             Write-Host "push $($item.Id) $($item.Version)"
             dotnet nuget push $file --source https://api.nuget.org/v3/index.json --api-key $env:NUGET_API_KEY --skip-duplicate
             if ($LASTEXITCODE -ne 0) { throw "Push of $($item.Id) $($item.Version) failed; later packages were not pushed." }
