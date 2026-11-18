@@ -1,0 +1,99 @@
+# Promotes N2 packages from the private vault-packages feed to nuget.org.
+# Scheduled: 1st of every month, package list in promotion.json, all rules (release only,
+# at least minAgeDays on the vault, newer than nuget.org).
+# Manual: optional explicit Id=Version list (age rule skipped), dry run by default.
+# nuget.org authentication is Trusted Publishing (GitHub OIDC -> short-lived key); no API key
+# is stored. The vault download uses the read-only Packaging PAT in secret NUGET_PAT.
+name: publish
+
+on:
+  schedule:
+    - cron: '0 6 1 * *'
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: 'Optional: Id=Version list, comma separated (skips the age rule). Empty = promotion.json with all rules.'
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: 'Dry run: plan and download only, push nothing.'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Unit tests (eligibility rules)
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0
+          $result = Invoke-Pester -Path tests -PassThru -Output Detailed
+          if ($result.FailedCount -gt 0) { exit 1 }
+
+      - name: Plan and download from vault-packages
+        id: plan
+        shell: pwsh
+        env:
+          VAULT_PAT: ${{ secrets.NUGET_PAT }}
+          EXPLICIT_PACKAGES: ${{ inputs.packages }}
+        run: ./scripts/Plan-Promotion.ps1 -OutDir out -ExplicitPackages "$env:EXPLICIT_PACKAGES"
+
+      - name: Upload packages
+        if: steps.plan.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: out/
+          retention-days: 7
+
+  push:
+    needs: plan
+    if: needs.plan.outputs.count != '0' && (github.event_name == 'schedule' || inputs.dry_run == false)
+    runs-on: ubuntu-latest
+    # Optional gate: add required reviewers to this environment in the repository settings.
+    environment: production
+    permissions:
+      id-token: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: out
+
+      - name: nuget.org login (Trusted Publishing)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: gjkaal
+
+      - name: Push to nuget.org
+        shell: pwsh
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $plan = Get-Content out/plan.json -Raw | ConvertFrom-Json
+          foreach ($item in $plan) {
+            $file = Join-Path out $item.File
+            if ((Get-FileHash $file -Algorithm SHA256).Hash -ne $item.Sha256) { throw "Hash mismatch for $($item.File)." }
+            Write-Host "push $($item.Id) $($item.Version)"
+            dotnet nuget push $file --source https://api.nuget.org/v3/index.json --api-key $env:NUGET_API_KEY --skip-duplicate
+            if ($LASTEXITCODE -ne 0) { throw "Push of $($item.Id) $($item.Version) failed; later packages were not pushed." }
+          }

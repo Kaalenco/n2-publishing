@@ -1,0 +1,16 @@
+{
+  "vault": {
+    "organization": "gjkaal",
+    "project": "3b3decf8-eba1-45d0-b47a-d9c1ce84f739",
+    "feed": "vault-packages"
+  },
+  "nugetOrgUser": "gjkaal",
+  "minAgeDays": 7,
+  "packages": [
+    "N2.Core.Abstractions",
+    "N2.Core",
+    "N2.Core.Entity",
+    "N2.Core.Identity",
+    "N2.LoggingService"
+  ]
+}
