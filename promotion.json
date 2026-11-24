@@ -10,6 +10,8 @@
     "N2.Core",
     "N2.Core.Entity",
     "N2.Core.Identity",
-    "N2.LoggingService"
+    "N2.LoggingService",
+    "N2.Mcp.Core",
+    "N2.DataStreams"
   ]
 }
